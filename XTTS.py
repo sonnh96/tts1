@@ -213,22 +213,38 @@ class XTTS:
 
     def split_text(self, text: str, lang: str = 'vi', max_tokens: int = 250) -> List[str]:
         """Split text into manageable chunks."""
+        # Input validation
+        if not text or not text.strip():
+            return [""]  # Return empty string chunk instead of empty list
+        
         if lang in ["ja", "zh-cn"]:
             sentences = text.split("。")
         else:
-            ss = sent_tokenize(text)
-            g = []
-            for s in ss:
-                g.extend(s.split(";"))
-            sentences = []
-            for s in g:
-                sentences.extend(s.split(","))
+            try:
+                ss = sent_tokenize(text)
+                g = []
+                for s in ss:
+                    g.extend(s.split(";"))
+                sentences = []
+                for s in g:
+                    sentences.extend(s.split(","))
+            except Exception as e:
+                print(f"⚠️  Text tokenization failed: {e}, using simple split")
+                sentences = text.split(".")  # Fallback to simple split
+
+        # Ensure we have at least one sentence
+        if not sentences:
+            sentences = [text]
 
         chunks = []
         current_chunk = []
         current_length = 0
         
         for sentence in sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+                
             sentence_tokens = len(sentence)
             
             if current_length + sentence_tokens > max_tokens:
@@ -237,6 +253,7 @@ class XTTS:
                     current_chunk = []
                     current_length = 0
                 else:
+                    # If single sentence is too long, add it anyway
                     chunks.append(sentence)
             else:
                 current_chunk.append(sentence)
@@ -244,17 +261,30 @@ class XTTS:
                 
         if current_chunk:
             chunks.append(' '.join(current_chunk))
+        
+        # Ensure we always return at least one chunk
+        if not chunks:
+            chunks = [text[:max_tokens]]  # Take first max_tokens characters
+            
+        return chunks
     def _calculate_optimal_batch_size(self, text_chunks):
         """Calculate optimal batch size based on available VRAM and text complexity."""
         if not torch.cuda.is_available():
             return 2
+        
+        # Handle edge cases
+        if not text_chunks or len(text_chunks) == 0:
+            return 4
         
         gpu_info = self._get_gpu_memory_info()
         if not gpu_info:
             return 4
         
         # Calculate batch size based on available memory and text complexity
-        avg_chunk_length = sum(len(chunk) for chunk in text_chunks) / len(text_chunks)
+        try:
+            avg_chunk_length = sum(len(chunk) for chunk in text_chunks) / len(text_chunks)
+        except (TypeError, ZeroDivisionError):
+            avg_chunk_length = 50  # Default fallback
         
         # More aggressive batch sizing to use more VRAM
         if gpu_info["free_gb"] > 6:  # Lots of free VRAM
@@ -270,11 +300,19 @@ class XTTS:
         if self._large_batch_mode:
             base_batch = int(base_batch * 1.5)
         
-        print(f"🎯 Optimal batch size: {base_batch} (Free VRAM: {gpu_info['free_gb']:.1f}GB, Avg chunk length: {avg_chunk_length:.0f})")
+        # Ensure batch size doesn't exceed number of chunks
+        base_batch = min(base_batch, len(text_chunks))
+        
+        print(f"🎯 Optimal batch size: {base_batch} (Free VRAM: {gpu_info['free_gb']:.1f}GB, Avg chunk length: {avg_chunk_length:.0f}, Total chunks: {len(text_chunks)})")
         return base_batch
 
     def _process_chunks_batch(self, text_chunks, lang_code, gpt_cond_latent, speaker_embedding, batch_size=4):
         """Process text chunks in large batches for maximum VRAM utilization."""
+        # Input validation
+        if not text_chunks or len(text_chunks) == 0:
+            print("⚠️  No text chunks to process")
+            return []
+            
         wav_chunks = []
         
         # Ensure conditioning tensors are on the correct device
@@ -286,7 +324,7 @@ class XTTS:
         tensor_cache = []
         
         # Use larger batch sizes to maximize VRAM usage
-        effective_batch_size = batch_size * 2 if self._large_batch_mode else batch_size
+        effective_batch_size = max(1, batch_size * 2 if self._large_batch_mode else batch_size)
         
         # Process chunks in larger batches
         for i in range(0, len(text_chunks), effective_batch_size):
@@ -297,11 +335,16 @@ class XTTS:
             
             # Pre-process all chunks in parallel for this batch
             for j, chunk in enumerate(batch_chunks):
-                if not chunk.strip():
+                if not chunk or not chunk.strip():
+                    print(f"⚠️  Skipping empty chunk {j+1}")
                     continue
                     
                 # Use cached inference if available
-                cache_key = f"{chunk}_{lang_code}_{hashlib.md5(str(gpt_cond_latent.cpu().numpy().tobytes()).encode()).hexdigest()[:8]}"
+                try:
+                    cache_key = f"{chunk}_{lang_code}_{hashlib.md5(str(gpt_cond_latent.cpu().numpy().tobytes()).encode()).hexdigest()[:8]}"
+                except Exception as e:
+                    print(f"⚠️  Cache key generation failed: {e}")
+                    cache_key = f"{chunk}_{lang_code}_{j}"
                 
                 if self._enable_caching and cache_key in self._text_cache:
                     wav_chunk = self._text_cache[cache_key]
@@ -323,44 +366,57 @@ class XTTS:
                                 num_beams=1,  # Single beam for speed
                             )
                     except RuntimeError as e:
-                        print(f"Error processing chunk {j+1}: {e}")
+                        print(f"❌ Error processing chunk {j+1}: {e}")
+                        continue
+                    except Exception as e:
+                        print(f"❌ Unexpected error processing chunk {j+1}: {e}")
                         continue
                     
                     # Cache the result in VRAM with larger cache size
                     if self._enable_caching and len(self._text_cache) < self._max_cache_size:
-                        # Keep cached results in VRAM for faster access
-                        if torch.cuda.is_available() and isinstance(wav_chunk["wav"], torch.Tensor):
-                            cached_wav = wav_chunk.copy()
-                            cached_wav["wav"] = wav_chunk["wav"].cuda() if not wav_chunk["wav"].is_cuda else wav_chunk["wav"]
-                            self._text_cache[cache_key] = cached_wav
-                        else:
-                            self._text_cache[cache_key] = wav_chunk
+                        try:
+                            # Keep cached results in VRAM for faster access
+                            if torch.cuda.is_available() and isinstance(wav_chunk["wav"], torch.Tensor):
+                                cached_wav = wav_chunk.copy()
+                                cached_wav["wav"] = wav_chunk["wav"].cuda() if not wav_chunk["wav"].is_cuda else wav_chunk["wav"]
+                                self._text_cache[cache_key] = cached_wav
+                            else:
+                                self._text_cache[cache_key] = wav_chunk
+                        except Exception as e:
+                            print(f"⚠️  Failed to cache result: {e}")
                 
                 # Adjust length for short sentences
-                keep_len = self._calculate_keep_len(chunk, lang_code)
-                if isinstance(wav_chunk["wav"], torch.Tensor):
-                    wav_tensor = wav_chunk["wav"][:keep_len]
-                else:
-                    wav_tensor = torch.tensor(wav_chunk["wav"][:keep_len])
-                
-                # Keep tensor in VRAM
-                if torch.cuda.is_available():
-                    wav_tensor = wav_tensor.cuda()
+                try:
+                    keep_len = self._calculate_keep_len(chunk, lang_code)
+                    if isinstance(wav_chunk["wav"], torch.Tensor):
+                        wav_tensor = wav_chunk["wav"][:keep_len]
+                    else:
+                        wav_tensor = torch.tensor(wav_chunk["wav"][:keep_len])
                     
-                batch_results.append(wav_tensor)
-                tensor_cache.append(wav_tensor)  # Keep reference to prevent cleanup
+                    # Keep tensor in VRAM
+                    if torch.cuda.is_available():
+                        wav_tensor = wav_tensor.cuda()
+                        
+                    batch_results.append(wav_tensor)
+                    tensor_cache.append(wav_tensor)  # Keep reference to prevent cleanup
+                except Exception as e:
+                    print(f"⚠️  Failed to process wav chunk {j+1}: {e}")
+                    continue
             
             wav_chunks.extend(batch_results)
             
             # Less frequent cache clearing to maintain VRAM usage
             if i % (effective_batch_size * 4) == 0:  # Clear less frequently
                 # Only clear if we're running low on memory
-                gpu_info = self._get_gpu_memory_info()
-                if gpu_info and gpu_info["utilization_percent"] > 90:
-                    print(f"High VRAM usage detected: {gpu_info['utilization_percent']:.1f}%, clearing cache")
-                    self._clear_gpu_cache()
+                try:
+                    gpu_info = self._get_gpu_memory_info()
+                    if gpu_info and gpu_info["utilization_percent"] > 90:
+                        print(f"High VRAM usage detected: {gpu_info['utilization_percent']:.1f}%, clearing cache")
+                        self._clear_gpu_cache()
+                except Exception as e:
+                    print(f"⚠️  VRAM monitoring failed: {e}")
         
-        print(f"Processed {len(text_chunks)} chunks using {len(tensor_cache)} cached tensors in VRAM")
+        print(f"✅ Processed {len(text_chunks)} chunks, generated {len(wav_chunks)} audio segments")
         return wav_chunks
 
     def generate_speech(
@@ -412,9 +468,17 @@ class XTTS:
         # Split text into chunks with optimized chunk size for VRAM usage
         text_chunks = self.split_text(text, lang_code, max_tokens=150)  # Smaller chunks for more batches
         
+        # Validate text chunks
+        if not text_chunks or len(text_chunks) == 0:
+            print("⚠️  No text chunks generated, creating fallback")
+            text_chunks = [text] if text.strip() else ["Hello"]
+        
         # Calculate optimal batch size for VRAM utilization
         if batch_size is None:
             batch_size = self._calculate_optimal_batch_size(text_chunks)
+        else:
+            # Ensure batch size doesn't exceed number of chunks
+            batch_size = min(batch_size, len(text_chunks))
         
         if verbose:
             print(f"📊 Processing {len(text_chunks)} chunks with batch size {batch_size}")
