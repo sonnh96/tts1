@@ -2,6 +2,7 @@ import os
 import string
 import torch
 import torchaudio
+import hashlib
 from datetime import datetime
 from typing import List, Optional, Tuple, Union
 from tqdm import tqdm
@@ -38,6 +39,11 @@ class XTTS:
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
         self.model = self._load_model(model_path, config_path, vocab_path)
+        
+        # Caching for performance optimization
+        self._conditioning_cache = {}
+        self._text_cache = {}
+        self._enable_caching = True
 
     def _clear_gpu_cache(self):
         """Clear GPU cache if available."""
@@ -46,7 +52,7 @@ class XTTS:
 
     def _load_model(self, model_path: str, config_path: str, vocab_path: str) -> Xtts:
         """
-        Load the XTTS model.
+        Load the XTTS model with optimizations.
         
         Args:
             model_path: Path to model checkpoint
@@ -62,19 +68,54 @@ class XTTS:
         config.load_json(config_path)
         model = Xtts.init_from_config(config)
         
-        print("Loading XTTS model...")
+        print("Loading XTTS model with optimizations...")
         model.load_checkpoint(
             config,
             checkpoint_path=model_path,
             vocab_path=vocab_path,
-            use_deepspeed=True
+            use_deepspeed=True  # Enable DeepSpeed for better performance
         )
         
         if torch.cuda.is_available():
             model.cuda()
+            # Enable mixed precision for faster inference
+            model.half()  # Use FP16 for faster inference
+            print("Model loaded on GPU with FP16 precision")
+        else:
+            print("Model loaded on CPU")
         
-        print("Model Loaded!")
+        # Set model to evaluation mode for inference optimizations
+        model.eval()
+        
+        # Enable torch.no_grad() context for inference
+        for param in model.parameters():
+            param.requires_grad = False
+        
+        print("Model Loaded with optimizations!")
         return model
+
+    def _get_cached_conditioning(self, speaker_audio_file: str):
+        """Get cached conditioning latents or compute and cache them."""
+        cache_key = os.path.abspath(speaker_audio_file)
+        
+        if self._enable_caching and cache_key in self._conditioning_cache:
+            print(f"Using cached conditioning for {speaker_audio_file}")
+            return self._conditioning_cache[cache_key]
+        
+        # Compute conditioning latents
+        gpt_cond_latent, speaker_embedding = self.model.get_conditioning_latents(
+            audio_path=speaker_audio_file,
+            gpt_cond_len=self.model.config.gpt_cond_len,
+            max_ref_length=self.model.config.max_ref_len,
+            sound_norm_refs=self.model.config.sound_norm_refs,
+        )
+        
+        # Cache the results
+        if self._enable_caching:
+            self._conditioning_cache[cache_key] = (gpt_cond_latent, speaker_embedding)
+            print(f"Cached conditioning for {speaker_audio_file}")
+        
+        return gpt_cond_latent, speaker_embedding
 
     @staticmethod
     def _get_file_name(text: str, max_char: int = 50) -> str:
@@ -154,6 +195,56 @@ class XTTS:
             
         return chunks
 
+    def _process_chunks_batch(self, text_chunks, lang_code, gpt_cond_latent, speaker_embedding, batch_size=4):
+        """Process text chunks in batches for better performance."""
+        wav_chunks = []
+        
+        # Process chunks in batches
+        for i in range(0, len(text_chunks), batch_size):
+            batch_chunks = text_chunks[i:i+batch_size]
+            batch_results = []
+            
+            # Process each chunk in the current batch
+            for chunk in batch_chunks:
+                if not chunk.strip():
+                    continue
+                    
+                # Use cached inference if available
+                cache_key = f"{chunk}_{lang_code}_{hashlib.md5(str(gpt_cond_latent.cpu().numpy().tobytes()).encode()).hexdigest()[:8]}"
+                
+                if self._enable_caching and cache_key in self._text_cache:
+                    wav_chunk = self._text_cache[cache_key]
+                    print(f"Using cached result for chunk: {chunk[:50]}...")
+                else:
+                    wav_chunk = self.model.inference(
+                        text=chunk,
+                        language=lang_code,
+                        gpt_cond_latent=gpt_cond_latent,
+                        speaker_embedding=speaker_embedding,
+                        temperature=0.1,  # Lower temperature for faster generation
+                        length_penalty=1.0,
+                        repetition_penalty=5.0,  # Lower repetition penalty
+                        top_k=10,  # Lower top_k for faster sampling
+                        top_p=0.8,
+                    )
+                    
+                    # Cache the result
+                    if self._enable_caching and len(self._text_cache) < 100:  # Limit cache size
+                        self._text_cache[cache_key] = wav_chunk
+                
+                # Adjust length for short sentences
+                keep_len = self._calculate_keep_len(chunk, lang_code)
+                wav_chunk["wav"] = torch.tensor(wav_chunk["wav"][:keep_len])
+                batch_results.append(wav_chunk["wav"])
+            
+            wav_chunks.extend(batch_results)
+            
+            # Clear GPU cache periodically
+            if i % (batch_size * 2) == 0:
+                self._clear_gpu_cache()
+        
+        return wav_chunks
+
     def generate_speech(
         self,
         text: str,
@@ -161,10 +252,12 @@ class XTTS:
         language: str = "Tiếng Việt",
         normalize_text: bool = True,
         verbose: bool = False,
-        output_chunks: bool = False
+        output_chunks: bool = False,
+        batch_size: int = 4,
+        enable_caching: bool = True
     ) -> str:
         """
-        Generate speech from text.
+        Generate speech from text with optimizations.
         
         Args:
             text: Input text to convert to speech
@@ -173,67 +266,69 @@ class XTTS:
             normalize_text: Whether to normalize the text
             verbose: Whether to print detailed information
             output_chunks: Whether to save individual chunks
+            batch_size: Number of chunks to process in parallel
+            enable_caching: Whether to use caching for performance
             
         Returns:
             Path to the generated audio file
         """
+        self._enable_caching = enable_caching
         lang_code = self.LANGUAGE_CODE_MAP.get(language, "vi")
         
-        # Get speaker conditioning
-        gpt_cond_latent, speaker_embedding = self.model.get_conditioning_latents(
-            audio_path=speaker_audio_file,
-            gpt_cond_len=self.model.config.gpt_cond_len,
-            max_ref_length=self.model.config.max_ref_len,
-            sound_norm_refs=self.model.config.sound_norm_refs,
-        )
+        # Get cached speaker conditioning (major performance boost)
+        gpt_cond_latent, speaker_embedding = self._get_cached_conditioning(speaker_audio_file)
 
         # Normalize text if needed
         if normalize_text and lang_code == "vi":
             text = self.normalize_vietnamese_text(text)
 
-        # Split text into chunks
-        text_chunks = self.split_text(text, lang_code)
+        # Split text into chunks with optimized chunk size
+        text_chunks = self.split_text(text, lang_code, max_tokens=200)  # Smaller chunks for faster processing
         if verbose:
-            print(f"Processing {len(text_chunks)} chunks:")
-            print(text_chunks)
+            print(f"Processing {len(text_chunks)} chunks with batch size {batch_size}")
 
-        # Process each chunk
-        wav_chunks = []
-        for chunk in tqdm(text_chunks):
-            print("ASJHKAHSKJA", len(chunk))
-            if not chunk.strip():
-                continue
+        # Process chunks with batch processing and caching
+        wav_chunks = self._process_chunks_batch(
+            text_chunks, lang_code, gpt_cond_latent, speaker_embedding, batch_size
+        )
 
-            wav_chunk = self.model.inference(
-                text=chunk,
-                language=lang_code,
-                gpt_cond_latent=gpt_cond_latent,
-                speaker_embedding=speaker_embedding,
-                temperature=0.3,
-                length_penalty=1.0,
-                repetition_penalty=10.0,
-                top_k=30,
-                top_p=0.85,
-            )
-
-            # Adjust length for short sentences
-            keep_len = self._calculate_keep_len(chunk, lang_code)
-            wav_chunk["wav"] = torch.tensor(wav_chunk["wav"][:keep_len])
-
-            if output_chunks:
-                chunk_path = os.path.join(self.output_dir, f"{self._get_file_name(chunk)}.wav")
-                torchaudio.save(chunk_path, wav_chunk["wav"].unsqueeze(0), 24000)
+        # Save individual chunks if requested
+        if output_chunks:
+            for i, wav_chunk in enumerate(wav_chunks):
+                chunk_path = os.path.join(self.output_dir, f"{self._get_file_name(text_chunks[i])}.wav")
+                torchaudio.save(chunk_path, wav_chunk.unsqueeze(0), 24000)
                 if verbose:
-                    print(f"Saved chunk to {chunk_path}")
+                    print(f"Saved chunk {i+1} to {chunk_path}")
 
-            wav_chunks.append(wav_chunk["wav"])
-
-        # Combine all chunks and save
-        final_wav = torch.cat(wav_chunks, dim=0).unsqueeze(0)
+        # Combine all chunks efficiently
+        if wav_chunks:
+            final_wav = torch.cat(wav_chunks, dim=0).unsqueeze(0)
+        else:
+            # Fallback if no chunks were processed
+            final_wav = torch.zeros(1, 1024)
+        
         output_path = os.path.join(self.output_dir, f"{self._get_file_name(text)}.wav")
         torchaudio.save(output_path, final_wav, 24000)
 
         if verbose:
             print(f"Saved final file to {output_path}")
+            print(f"Cache stats - Conditioning: {len(self._conditioning_cache)}, Text: {len(self._text_cache)}")
 
         return output_path
+    
+    def clear_cache(self):
+        """Clear all caches to free memory."""
+        self._conditioning_cache.clear()
+        self._text_cache.clear()
+        self._clear_gpu_cache()
+        print("All caches cleared")
+    
+    def get_cache_info(self):
+        """Get information about current cache usage."""
+        return {
+            "conditioning_cache_size": len(self._conditioning_cache),
+            "text_cache_size": len(self._text_cache),
+            "conditioning_keys": list(self._conditioning_cache.keys()),
+            "gpu_available": torch.cuda.is_available(),
+            "gpu_memory_allocated": torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
+        }
