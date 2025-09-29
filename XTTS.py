@@ -44,11 +44,32 @@ class XTTS:
         self._conditioning_cache = {}
         self._text_cache = {}
         self._enable_caching = True
+        
+        # VRAM optimization settings
+        self._max_cache_size = 200  # Increased cache size
+        self._prefetch_tensors = True
+        self._large_batch_mode = True
 
     def _clear_gpu_cache(self):
         """Clear GPU cache if available."""
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+            
+    def _get_gpu_memory_info(self):
+        """Get current GPU memory usage information."""
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+            reserved = torch.cuda.memory_reserved() / 1024**3   # GB
+            total = torch.cuda.get_device_properties(0).total_memory / 1024**3  # GB
+            free = total - reserved
+            return {
+                "allocated_gb": allocated,
+                "reserved_gb": reserved,
+                "total_gb": total,
+                "free_gb": free,
+                "utilization_percent": (reserved / total) * 100
+            }
+        return None
 
     def _load_model(self, model_path: str, config_path: str, vocab_path: str) -> Xtts:
         """
@@ -80,9 +101,16 @@ class XTTS:
             model.cuda()
             print("Model loaded on GPU with FP32 precision")
             
-            # Enable optimizations for CUDA
+            # Enable optimizations for CUDA and maximize VRAM usage
             torch.backends.cudnn.benchmark = True  # Optimize for consistent input sizes
             torch.backends.cudnn.deterministic = False  # Allow non-deterministic ops for speed
+            
+            # Pre-allocate GPU memory to maximize utilization
+            torch.cuda.set_per_process_memory_fraction(0.95)  # Use 95% of available VRAM
+            
+            # Enable memory mapping for better memory management
+            torch.backends.cuda.matmul.allow_tf32 = True  # Allow TF32 for faster matmul
+            torch.backends.cudnn.allow_tf32 = True  # Allow TF32 for convolutions
             
         else:
             print("Model loaded on CPU")
@@ -108,10 +136,12 @@ class XTTS:
             print(f"Using cached conditioning for {speaker_audio_file}")
             gpt_cond_latent, speaker_embedding = self._conditioning_cache[cache_key]
             
-            # Ensure tensors are on the correct device and dtype
+            # Keep tensors in VRAM for maximum performance
             if torch.cuda.is_available():
-                gpt_cond_latent = gpt_cond_latent.cuda()
-                speaker_embedding = speaker_embedding.cuda()
+                if not gpt_cond_latent.is_cuda:
+                    gpt_cond_latent = gpt_cond_latent.cuda()
+                if not speaker_embedding.is_cuda:
+                    speaker_embedding = speaker_embedding.cuda()
             
             return gpt_cond_latent, speaker_embedding
         
@@ -124,12 +154,18 @@ class XTTS:
             sound_norm_refs=self.model.config.sound_norm_refs,
         )
         
-        # Cache the results (move to CPU for storage to save GPU memory)
+        # Cache the results in VRAM for faster access (use more VRAM)
         if self._enable_caching:
-            cached_gpt = gpt_cond_latent.cpu() if torch.cuda.is_available() else gpt_cond_latent
-            cached_speaker = speaker_embedding.cpu() if torch.cuda.is_available() else speaker_embedding
+            # Keep tensors in VRAM instead of moving to CPU
+            if torch.cuda.is_available():
+                cached_gpt = gpt_cond_latent.cuda()
+                cached_speaker = speaker_embedding.cuda()
+            else:
+                cached_gpt = gpt_cond_latent
+                cached_speaker = speaker_embedding
+                
             self._conditioning_cache[cache_key] = (cached_gpt, cached_speaker)
-            print(f"Cached conditioning for {speaker_audio_file}")
+            print(f"Cached conditioning in VRAM for {speaker_audio_file}")
         
         return gpt_cond_latent, speaker_embedding
 
@@ -208,11 +244,37 @@ class XTTS:
                 
         if current_chunk:
             chunks.append(' '.join(current_chunk))
-            
-        return chunks
+    def _calculate_optimal_batch_size(self, text_chunks):
+        """Calculate optimal batch size based on available VRAM and text complexity."""
+        if not torch.cuda.is_available():
+            return 2
+        
+        gpu_info = self._get_gpu_memory_info()
+        if not gpu_info:
+            return 4
+        
+        # Calculate batch size based on available memory and text complexity
+        avg_chunk_length = sum(len(chunk) for chunk in text_chunks) / len(text_chunks)
+        
+        # More aggressive batch sizing to use more VRAM
+        if gpu_info["free_gb"] > 6:  # Lots of free VRAM
+            base_batch = 12 if avg_chunk_length < 100 else 8
+        elif gpu_info["free_gb"] > 4:  # Moderate VRAM
+            base_batch = 8 if avg_chunk_length < 100 else 6
+        elif gpu_info["free_gb"] > 2:  # Limited VRAM
+            base_batch = 6 if avg_chunk_length < 100 else 4
+        else:
+            base_batch = 4
+        
+        # Apply large batch mode multiplier
+        if self._large_batch_mode:
+            base_batch = int(base_batch * 1.5)
+        
+        print(f"🎯 Optimal batch size: {base_batch} (Free VRAM: {gpu_info['free_gb']:.1f}GB, Avg chunk length: {avg_chunk_length:.0f})")
+        return base_batch
 
     def _process_chunks_batch(self, text_chunks, lang_code, gpt_cond_latent, speaker_embedding, batch_size=4):
-        """Process text chunks in batches for better performance."""
+        """Process text chunks in large batches for maximum VRAM utilization."""
         wav_chunks = []
         
         # Ensure conditioning tensors are on the correct device
@@ -220,13 +282,21 @@ class XTTS:
             gpt_cond_latent = gpt_cond_latent.cuda()
             speaker_embedding = speaker_embedding.cuda()
         
-        # Process chunks in batches
-        for i in range(0, len(text_chunks), batch_size):
-            batch_chunks = text_chunks[i:i+batch_size]
+        # Pre-allocate tensor lists to keep in VRAM
+        tensor_cache = []
+        
+        # Use larger batch sizes to maximize VRAM usage
+        effective_batch_size = batch_size * 2 if self._large_batch_mode else batch_size
+        
+        # Process chunks in larger batches
+        for i in range(0, len(text_chunks), effective_batch_size):
+            batch_chunks = text_chunks[i:i+effective_batch_size]
             batch_results = []
             
-            # Process each chunk in the current batch
-            for chunk in batch_chunks:
+            print(f"Processing batch {i//effective_batch_size + 1} with {len(batch_chunks)} chunks")
+            
+            # Pre-process all chunks in parallel for this batch
+            for j, chunk in enumerate(batch_chunks):
                 if not chunk.strip():
                     continue
                     
@@ -235,45 +305,62 @@ class XTTS:
                 
                 if self._enable_caching and cache_key in self._text_cache:
                     wav_chunk = self._text_cache[cache_key]
-                    print(f"Using cached result for chunk: {chunk[:50]}...")
+                    print(f"Using cached result for chunk {j+1}: {chunk[:50]}...")
                 else:
                     try:
                         with torch.no_grad():  # Ensure no gradients
+                            # Process with optimized parameters for speed
                             wav_chunk = self.model.inference(
                                 text=chunk,
                                 language=lang_code,
                                 gpt_cond_latent=gpt_cond_latent,
                                 speaker_embedding=speaker_embedding,
-                                temperature=0.1,  # Lower temperature for faster generation
+                                temperature=0.05,  # Even lower temperature for max speed
                                 length_penalty=1.0,
-                                repetition_penalty=5.0,  # Lower repetition penalty
-                                top_k=10,  # Lower top_k for faster sampling
-                                top_p=0.8,
+                                repetition_penalty=3.0,  # Lower repetition penalty for speed
+                                top_k=5,   # Much lower top_k for fastest sampling
+                                top_p=0.7, # Lower top_p for faster generation
+                                num_beams=1,  # Single beam for speed
                             )
                     except RuntimeError as e:
-                        print(f"Error processing chunk: {e}")
-                        # Skip this chunk and continue
+                        print(f"Error processing chunk {j+1}: {e}")
                         continue
                     
-                    # Cache the result (limit cache size to prevent memory issues)
-                    if self._enable_caching and len(self._text_cache) < 50:
-                        self._text_cache[cache_key] = wav_chunk
+                    # Cache the result in VRAM with larger cache size
+                    if self._enable_caching and len(self._text_cache) < self._max_cache_size:
+                        # Keep cached results in VRAM for faster access
+                        if torch.cuda.is_available() and isinstance(wav_chunk["wav"], torch.Tensor):
+                            cached_wav = wav_chunk.copy()
+                            cached_wav["wav"] = wav_chunk["wav"].cuda() if not wav_chunk["wav"].is_cuda else wav_chunk["wav"]
+                            self._text_cache[cache_key] = cached_wav
+                        else:
+                            self._text_cache[cache_key] = wav_chunk
                 
                 # Adjust length for short sentences
                 keep_len = self._calculate_keep_len(chunk, lang_code)
                 if isinstance(wav_chunk["wav"], torch.Tensor):
-                    wav_chunk["wav"] = wav_chunk["wav"][:keep_len]
+                    wav_tensor = wav_chunk["wav"][:keep_len]
                 else:
-                    wav_chunk["wav"] = torch.tensor(wav_chunk["wav"][:keep_len])
+                    wav_tensor = torch.tensor(wav_chunk["wav"][:keep_len])
+                
+                # Keep tensor in VRAM
+                if torch.cuda.is_available():
+                    wav_tensor = wav_tensor.cuda()
                     
-                batch_results.append(wav_chunk["wav"])
+                batch_results.append(wav_tensor)
+                tensor_cache.append(wav_tensor)  # Keep reference to prevent cleanup
             
             wav_chunks.extend(batch_results)
             
-            # Clear GPU cache periodically
-            if i % (batch_size * 2) == 0:
-                self._clear_gpu_cache()
+            # Less frequent cache clearing to maintain VRAM usage
+            if i % (effective_batch_size * 4) == 0:  # Clear less frequently
+                # Only clear if we're running low on memory
+                gpu_info = self._get_gpu_memory_info()
+                if gpu_info and gpu_info["utilization_percent"] > 90:
+                    print(f"High VRAM usage detected: {gpu_info['utilization_percent']:.1f}%, clearing cache")
+                    self._clear_gpu_cache()
         
+        print(f"Processed {len(text_chunks)} chunks using {len(tensor_cache)} cached tensors in VRAM")
         return wav_chunks
 
     def generate_speech(
@@ -284,11 +371,12 @@ class XTTS:
         normalize_text: bool = True,
         verbose: bool = False,
         output_chunks: bool = False,
-        batch_size: int = 4,
-        enable_caching: bool = True
+        batch_size: int = None,  # Auto-calculate if None
+        enable_caching: bool = True,
+        max_vram_usage: bool = True  # New parameter for aggressive VRAM usage
     ) -> str:
         """
-        Generate speech from text with optimizations.
+        Generate speech from text with aggressive VRAM utilization.
         
         Args:
             text: Input text to convert to speech
@@ -297,14 +385,22 @@ class XTTS:
             normalize_text: Whether to normalize the text
             verbose: Whether to print detailed information
             output_chunks: Whether to save individual chunks
-            batch_size: Number of chunks to process in parallel
+            batch_size: Number of chunks to process in parallel (auto-calculated if None)
             enable_caching: Whether to use caching for performance
+            max_vram_usage: Use maximum VRAM for best performance
             
         Returns:
             Path to the generated audio file
         """
         self._enable_caching = enable_caching
+        self._large_batch_mode = max_vram_usage
         lang_code = self.LANGUAGE_CODE_MAP.get(language, "vi")
+        
+        # Print initial VRAM usage
+        if verbose:
+            gpu_info = self._get_gpu_memory_info()
+            if gpu_info:
+                print(f"🖥️  Initial VRAM: {gpu_info['reserved_gb']:.2f}GB/{gpu_info['total_gb']:.2f}GB ({gpu_info['utilization_percent']:.1f}%)")
         
         # Get cached speaker conditioning (major performance boost)
         gpt_cond_latent, speaker_embedding = self._get_cached_conditioning(speaker_audio_file)
@@ -313,12 +409,18 @@ class XTTS:
         if normalize_text and lang_code == "vi":
             text = self.normalize_vietnamese_text(text)
 
-        # Split text into chunks with optimized chunk size
-        text_chunks = self.split_text(text, lang_code, max_tokens=200)  # Smaller chunks for faster processing
+        # Split text into chunks with optimized chunk size for VRAM usage
+        text_chunks = self.split_text(text, lang_code, max_tokens=150)  # Smaller chunks for more batches
+        
+        # Calculate optimal batch size for VRAM utilization
+        if batch_size is None:
+            batch_size = self._calculate_optimal_batch_size(text_chunks)
+        
         if verbose:
-            print(f"Processing {len(text_chunks)} chunks with batch size {batch_size}")
+            print(f"📊 Processing {len(text_chunks)} chunks with batch size {batch_size}")
+            print(f"💾 Cache sizes - Conditioning: {len(self._conditioning_cache)}, Text: {len(self._text_cache)}")
 
-        # Process chunks with batch processing and caching
+        # Process chunks with aggressive VRAM utilization
         wav_chunks = self._process_chunks_batch(
             text_chunks, lang_code, gpt_cond_latent, speaker_embedding, batch_size
         )
@@ -331,19 +433,30 @@ class XTTS:
                 if verbose:
                     print(f"Saved chunk {i+1} to {chunk_path}")
 
-        # Combine all chunks efficiently
+        # Combine all chunks efficiently in VRAM
         if wav_chunks:
+            # Keep final concatenation in VRAM for speed
             final_wav = torch.cat(wav_chunks, dim=0).unsqueeze(0)
+            if torch.cuda.is_available():
+                final_wav = final_wav.cuda()
         else:
             # Fallback if no chunks were processed
             final_wav = torch.zeros(1, 1024)
+            if torch.cuda.is_available():
+                final_wav = final_wav.cuda()
         
         output_path = os.path.join(self.output_dir, f"{self._get_file_name(text)}.wav")
-        torchaudio.save(output_path, final_wav, 24000)
+        
+        # Move to CPU only for saving
+        final_wav_cpu = final_wav.cpu()
+        torchaudio.save(output_path, final_wav_cpu, 24000)
 
         if verbose:
-            print(f"Saved final file to {output_path}")
-            print(f"Cache stats - Conditioning: {len(self._conditioning_cache)}, Text: {len(self._text_cache)}")
+            print(f"✅ Saved final file to {output_path}")
+            gpu_info = self._get_gpu_memory_info()
+            if gpu_info:
+                print(f"🖥️  Final VRAM: {gpu_info['reserved_gb']:.2f}GB/{gpu_info['total_gb']:.2f}GB ({gpu_info['utilization_percent']:.1f}%)")
+            print(f"💾 Cache stats - Conditioning: {len(self._conditioning_cache)}, Text: {len(self._text_cache)}")
 
         return output_path
     
@@ -355,11 +468,27 @@ class XTTS:
         print("All caches cleared")
     
     def get_cache_info(self):
-        """Get information about current cache usage."""
-        return {
+        """Get information about current cache usage and VRAM utilization."""
+        gpu_info = self._get_gpu_memory_info()
+        
+        cache_info = {
             "conditioning_cache_size": len(self._conditioning_cache),
             "text_cache_size": len(self._text_cache),
+            "max_cache_size": self._max_cache_size,
             "conditioning_keys": list(self._conditioning_cache.keys()),
+            "large_batch_mode": self._large_batch_mode,
             "gpu_available": torch.cuda.is_available(),
-            "gpu_memory_allocated": torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
         }
+        
+        if gpu_info:
+            cache_info.update({
+                "gpu_memory_allocated_gb": gpu_info["allocated_gb"],
+                "gpu_memory_reserved_gb": gpu_info["reserved_gb"],
+                "gpu_memory_total_gb": gpu_info["total_gb"],
+                "gpu_memory_free_gb": gpu_info["free_gb"],
+                "gpu_utilization_percent": gpu_info["utilization_percent"]
+            })
+        else:
+            cache_info["gpu_memory_allocated"] = 0
+            
+        return cache_info

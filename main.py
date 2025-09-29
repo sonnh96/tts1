@@ -36,8 +36,9 @@ async def gen_audio(item: Data):
         normalize_text=True,
         verbose=True,
         output_chunks=False,  # Disable individual chunk saving for speed
-        batch_size=6,  # Process more chunks in parallel
-        enable_caching=True  # Enable caching for repeated requests
+        batch_size=None,  # Auto-calculate optimal batch size for VRAM
+        enable_caching=True,  # Enable caching for repeated requests
+        max_vram_usage=True   # Use maximum VRAM for best performance
     )
     file_url = f"/static/{os.path.basename(output_file)}"
     return FileResponse(output_file, media_type="audio/wav", filename=os.path.basename(output_file))
