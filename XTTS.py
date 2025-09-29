@@ -78,11 +78,17 @@ class XTTS:
         
         if torch.cuda.is_available():
             model.cuda()
-            # Enable mixed precision for faster inference
-            model.half()  # Use FP16 for faster inference
-            print("Model loaded on GPU with FP16 precision")
+            print("Model loaded on GPU with FP32 precision")
+            
+            # Enable optimizations for CUDA
+            torch.backends.cudnn.benchmark = True  # Optimize for consistent input sizes
+            torch.backends.cudnn.deterministic = False  # Allow non-deterministic ops for speed
+            
         else:
             print("Model loaded on CPU")
+            
+            # CPU-specific optimizations
+            torch.set_num_threads(4)  # Optimize CPU thread usage
         
         # Set model to evaluation mode for inference optimizations
         model.eval()
@@ -100,9 +106,17 @@ class XTTS:
         
         if self._enable_caching and cache_key in self._conditioning_cache:
             print(f"Using cached conditioning for {speaker_audio_file}")
-            return self._conditioning_cache[cache_key]
+            gpt_cond_latent, speaker_embedding = self._conditioning_cache[cache_key]
+            
+            # Ensure tensors are on the correct device and dtype
+            if torch.cuda.is_available():
+                gpt_cond_latent = gpt_cond_latent.cuda()
+                speaker_embedding = speaker_embedding.cuda()
+            
+            return gpt_cond_latent, speaker_embedding
         
         # Compute conditioning latents
+        print(f"Computing conditioning for {speaker_audio_file}")
         gpt_cond_latent, speaker_embedding = self.model.get_conditioning_latents(
             audio_path=speaker_audio_file,
             gpt_cond_len=self.model.config.gpt_cond_len,
@@ -110,9 +124,11 @@ class XTTS:
             sound_norm_refs=self.model.config.sound_norm_refs,
         )
         
-        # Cache the results
+        # Cache the results (move to CPU for storage to save GPU memory)
         if self._enable_caching:
-            self._conditioning_cache[cache_key] = (gpt_cond_latent, speaker_embedding)
+            cached_gpt = gpt_cond_latent.cpu() if torch.cuda.is_available() else gpt_cond_latent
+            cached_speaker = speaker_embedding.cpu() if torch.cuda.is_available() else speaker_embedding
+            self._conditioning_cache[cache_key] = (cached_gpt, cached_speaker)
             print(f"Cached conditioning for {speaker_audio_file}")
         
         return gpt_cond_latent, speaker_embedding
@@ -199,6 +215,11 @@ class XTTS:
         """Process text chunks in batches for better performance."""
         wav_chunks = []
         
+        # Ensure conditioning tensors are on the correct device
+        if torch.cuda.is_available():
+            gpt_cond_latent = gpt_cond_latent.cuda()
+            speaker_embedding = speaker_embedding.cuda()
+        
         # Process chunks in batches
         for i in range(0, len(text_chunks), batch_size):
             batch_chunks = text_chunks[i:i+batch_size]
@@ -216,25 +237,35 @@ class XTTS:
                     wav_chunk = self._text_cache[cache_key]
                     print(f"Using cached result for chunk: {chunk[:50]}...")
                 else:
-                    wav_chunk = self.model.inference(
-                        text=chunk,
-                        language=lang_code,
-                        gpt_cond_latent=gpt_cond_latent,
-                        speaker_embedding=speaker_embedding,
-                        temperature=0.1,  # Lower temperature for faster generation
-                        length_penalty=1.0,
-                        repetition_penalty=5.0,  # Lower repetition penalty
-                        top_k=10,  # Lower top_k for faster sampling
-                        top_p=0.8,
-                    )
+                    try:
+                        with torch.no_grad():  # Ensure no gradients
+                            wav_chunk = self.model.inference(
+                                text=chunk,
+                                language=lang_code,
+                                gpt_cond_latent=gpt_cond_latent,
+                                speaker_embedding=speaker_embedding,
+                                temperature=0.1,  # Lower temperature for faster generation
+                                length_penalty=1.0,
+                                repetition_penalty=5.0,  # Lower repetition penalty
+                                top_k=10,  # Lower top_k for faster sampling
+                                top_p=0.8,
+                            )
+                    except RuntimeError as e:
+                        print(f"Error processing chunk: {e}")
+                        # Skip this chunk and continue
+                        continue
                     
-                    # Cache the result
-                    if self._enable_caching and len(self._text_cache) < 100:  # Limit cache size
+                    # Cache the result (limit cache size to prevent memory issues)
+                    if self._enable_caching and len(self._text_cache) < 50:
                         self._text_cache[cache_key] = wav_chunk
                 
                 # Adjust length for short sentences
                 keep_len = self._calculate_keep_len(chunk, lang_code)
-                wav_chunk["wav"] = torch.tensor(wav_chunk["wav"][:keep_len])
+                if isinstance(wav_chunk["wav"], torch.Tensor):
+                    wav_chunk["wav"] = wav_chunk["wav"][:keep_len]
+                else:
+                    wav_chunk["wav"] = torch.tensor(wav_chunk["wav"][:keep_len])
+                    
                 batch_results.append(wav_chunk["wav"])
             
             wav_chunks.extend(batch_results)

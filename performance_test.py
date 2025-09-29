@@ -100,8 +100,8 @@ def test_performance():
     print(f"\n📊 PERFORMANCE SUMMARY")
     print("=" * 50)
     print(f"Model initialization time: {init_time:.2f}s")
-    print(f"Average time with caching: {sum(cache_times)/len(cache_times):.2f}s")
-    print(f"Average time without caching: {sum(no_cache_times)/len(no_cache_times):.2f}s")
+    print(f"Average time with optimizations: {sum(cache_times)/len(cache_times):.2f}s")
+    print(f"Average time without optimizations: {sum(no_cache_times)/len(no_cache_times):.2f}s")
     if no_cache_times:
         improvement = (sum(no_cache_times)/len(no_cache_times)) / (sum(cache_times[:len(no_cache_times)])/len(no_cache_times[:len(cache_times)]))
         print(f"Performance improvement: {improvement:.2f}x faster with optimizations")
